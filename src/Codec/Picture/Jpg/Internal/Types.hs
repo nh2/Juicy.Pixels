@@ -27,7 +27,9 @@ module Codec.Picture.Jpg.Internal.Types( MutableMacroBlock
                               , calculateSize
                               , dctBlockSize
                               , skipUntilFrames
+                              , parseNextFrame
                               , parseFrames
+                              , parseToFirstFrameHeader
                               ) where
 
 
@@ -56,7 +58,6 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as L
 
-import Data.Maybe( maybeToList )
 import Data.Int( Int16 )
 import Data.Word(Word8, Word16 )
 import Data.Binary( Binary(..) )
@@ -67,6 +68,7 @@ import Data.Binary.Get( Get
                       , getByteString
                       , skip
                       , bytesRead
+                      , lookAhead
                       )
 
 import Data.Binary.Put( Put
@@ -559,31 +561,43 @@ skipFrameMarker = do
         fail $ "Invalid Frame marker (" ++ show word
                 ++ ", bytes read : " ++ show readedData ++ ")"
 
-parseFrames :: Get [JpgFrame]
-parseFrames = do
+-- | Returns `Nothing` when we encounter a frame we want to skip.
+parseNextFrame :: Get (Maybe JpgFrame)
+parseNextFrame = do
     kind <- get
     case kind of
-        JpgEndOfImage -> return []
-        JpgAppSegment 0 ->
-            (\frm lst -> maybeToList (parseJF__ frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
-        JpgAppSegment 1 ->
-            (\frm lst -> maybeToList (parseExif frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
-        JpgAppSegment 14 ->
-            (\frm lst -> maybeToList (parseAdobe14 frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
-        JpgAppSegment c ->
-            (\frm lst -> JpgAppFrame c frm : lst) <$> takeCurrentFrame <*> parseFollowingFrames
-        JpgExtensionSegment c ->
-            (\frm lst -> JpgExtension c frm : lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgEndOfImage -> return Nothing
+        JpgAppSegment 0 -> parseJF__ <$> takeCurrentFrame
+        JpgAppSegment 1 -> parseExif <$> takeCurrentFrame
+        JpgAppSegment 14 -> parseAdobe14 <$> takeCurrentFrame
+        JpgAppSegment c -> Just . JpgAppFrame c <$> takeCurrentFrame
+        JpgExtensionSegment c -> Just . JpgExtension c <$> takeCurrentFrame
         JpgQuantizationTable ->
-            (\(TableList quants) lst -> JpgQuantTable quants : lst) <$> get <*> parseFollowingFrames
+            (\(TableList quants) -> Just $! JpgQuantTable quants) <$> get
         JpgRestartInterval ->
-            (\(RestartInterval i) lst -> JpgIntervalRestart i : lst) <$> get <*> parseFollowingFrames
+            (\(RestartInterval i) -> Just $! JpgIntervalRestart i) <$> get
         JpgHuffmanTableMarker ->
-            (\(TableList huffTables) lst ->
-                    JpgHuffmanTable [(t, packHuffmanTree . buildPackedHuffmanTree $ huffCodes t) | t <- huffTables] : lst)
-                    <$> get <*> parseFollowingFrames
-        JpgStartOfScan ->
-            (\scanHeader remainingBytes ->
+            (\(TableList huffTables) -> Just $!
+                    JpgHuffmanTable [(t, packHuffmanTree . buildPackedHuffmanTree $ huffCodes t) | t <- huffTables])
+                    <$> get
+        JpgStartOfScan -> do
+            scanHeader <- get
+            (d, _other) <- extractScanContent <$> lookAhead getRemainingLazyBytes
+            skip (fromIntegral $ L.length d)
+            return $ Just $! JpgScanBlob scanHeader d
+        _ -> Just . JpgScans kind <$> get
+
+parseFrames :: Get [JpgFrame]
+parseFrames = do
+    mbFrame <- parseNextFrame
+    case mbFrame of
+        Nothing -> parseFollowingFrames -- skip frame
+        Just frame -> case frame of
+            -- After we've encountered the first scan blob containing encoded image data,
+            -- we accept that anything else after that is allowed to fail and we'll ignore
+            -- that failure.
+            -- TODO: Explain why JuicyPixel chose to use this logic.
+            JpgScanBlob{} -> do
                 -- Note that we do this funny thing of doing `runGet` inside a `Get` parser.
                 -- This is because `binary` does not allow to run a parser and catch a `fail`,
                 -- (Which is what the current logic below does, namely just discarding any failing
@@ -593,18 +607,33 @@ parseFrames = do
                 -- on `other`.
                 -- Note this will make the error offset recorded by `fail` unhelpful because it
                 -- will be relative to the the start of `other`, not relative to the start of the JPG.
-                let (d, other) = extractScanContent remainingBytes
-                in
-                case runGet parseFrames (L.drop 1 other) of
-                  Left _ -> [JpgScanBlob scanHeader d]
-                  Right lst -> JpgScanBlob scanHeader d : lst
-            ) <$> get <*> getRemainingLazyBytes
+                remainingBytes <- getRemainingLazyBytes
+                case runGet parseFrames (L.drop 1 remainingBytes) of -- TODO Why `drop 1` instead of `runGet parseFollowingFrames remainingBytes` that would check that the dropped 1 Byte is really a frame marker?
+                    Left _ -> return [frame]
+                    Right lst -> return $ frame : lst
 
-        _ -> (\hdr lst -> JpgScans kind hdr : lst) <$> get <*> parseFollowingFrames
+            _ -> (frame :) <$> parseFollowingFrames
   where
     parseFollowingFrames = do
         skipFrameMarker
         parseFrames
+
+-- | Parses forward, returning the first scan header encountered.
+parseToFirstFrameHeader :: Get (Maybe JpgFrameHeader)
+parseToFirstFrameHeader = do
+    mbFrame <- parseNextFrame
+    case mbFrame of
+        Nothing -> continueSearching
+        Just frame -> case frame of
+            -- If we encounter a scan blob containing compressed data before
+            -- encountering the frame header that tells its dimensions, fail the parser.
+            JpgScanBlob{} -> fail "parseToFirstFrameHeader: Encountered scan data blob before frame header that tells its dimensions"
+            JpgScans _ frameHeader -> return $ Just $! frameHeader
+            _ -> continueSearching
+  where
+    continueSearching = do
+        skipFrameMarker
+        parseToFirstFrameHeader
 
 buildPackedHuffmanTree :: V.Vector (VU.Vector Word8) -> HuffmanTree
 buildPackedHuffmanTree = buildHuffmanTree . map VU.toList . V.toList
