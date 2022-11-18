@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -27,7 +28,7 @@ module Codec.Picture.Jpg.Internal.Types( MutableMacroBlock
                               , calculateSize
                               , dctBlockSize
                               , skipUntilFrames
-                              , parseNextFrame
+                              , parseNextFrameLazy
                               , parseFrames
                               , parseToFirstFrameHeader
                               ) where
@@ -85,7 +86,7 @@ import Codec.Picture.Tiff.Internal.Types
 import Codec.Picture.Tiff.Internal.Metadata( exifOffsetIfd )
 import Codec.Picture.Metadata.Exif
 
-{-import Debug.Trace-}
+import Debug.Trace
 import Text.Printf
 
 -- | Type only used to make clear what kind of integer we are carrying
@@ -497,6 +498,20 @@ checkMarker b1 b2 = do
     when (rb1 /= b1 || rb2 /= b2)
          (fail "Invalid marker used")
 
+-- | Splits a Scan's compressed image data from the given ByteString,
+-- returning the compressed image data and the rest of the data.
+-- That the given ByteString should be the part that immediately follows an SOS tag.
+--
+-- As described on e.g. https://www.ccoderun.ca/programming/2017-01-31_jpeg/,
+--
+-- > To find the next segment after the SOS, you must keep reading until you
+-- > find a 0xFF bytes which is not immediately followed by 0x00 (see "byte stuffing").
+-- > Normally, this will be the EOI segment that comes at the end of the file.
+--
+-- where the 0xFF is the next segment's marker.
+--
+-- This function returns the compressed image data, not including that next segment's
+-- marker on its trailing end.
 extractScanContent :: L.ByteString -> (L.ByteString, L.ByteString)
 extractScanContent str = aux 0
   where maxi = fromIntegral $ L.length str - 1
@@ -561,9 +576,71 @@ skipFrameMarker = do
         fail $ "Invalid Frame marker (" ++ show word
                 ++ ", bytes read : " ++ show readedData ++ ")"
 
--- | Returns `Nothing` when we encounter a frame we want to skip.
-parseNextFrame :: Get (Maybe JpgFrame)
-parseNextFrame = do
+-- | Parse a single frame.
+--
+-- Returns `Nothing` when we encounter a frame we want to skip.
+--
+-- This function has various quirks; consider the below with great caution
+-- when using this function.
+--
+-- While @data JpgFrame = ... | JpgScanBlob !...` itself has strict fields,
+-- this function returns a lazy `Maybe` whose `Just` constructor can contain a thunk.
+-- This allows `parseFrames` (which calls `parseNextFrameLazy`) to construct
+-- a lazy @[JpgFrame]@ such that the expensive byte-by-byte traversal
+-- in `extractScanContent` to create a `JpgScanBlob` can be avoided if only
+-- list elements before that `JpgScanBlob` are evaluated.
+--
+-- That means the user can write code such as
+--
+-- > let mbFirstScan =
+-- >       case runGetOrFail (get @JPG.JpgImage) hugeImageByteString of
+-- >         Right (_restBs, _offset, res) ->
+-- >           find (\frame -> case frame of { JPG.JpgScans{} -> True; _ -> False }) (JPG.jpgFrame res)
+--
+-- with the guarantee that only the first few bytes of the @hugeImageByteString@
+-- will be inspected, assuming that indeed there is at least 1 `JpgScan` in front
+-- of the `JpgScanBlob` that contains the huge amnount of compressed image data.
+--
+-- This guarantee can be useful to e.g. quickly read just the image
+-- dimensions (width, height) without traversing the compressed image data.
+--
+-- Also note that this `Get` parser does not correctly maintain the parser byte offset
+-- (`Data.Binary.Get.bytesRead`) once a `JpgScanBlob` is returned,
+-- since it uses `Data.Binary.Get.getRemainingLazyBytes` to provide:
+--
+-- 1. the laziness described above, and
+-- 2. the ability to ignore any parser failure after the first successfully-parsed
+--    `JpgScanBlob` (it is debatable whether this behaviour is a nice behaviour of this
+--    library, but it is historically so and existing exposed functions do not break
+--    this for backwards compatibility with existing uses of this library).
+--    This fact also means that even `parseNextFrameStrict` cannot maintain
+--    correct parser byte offsets.
+--
+-- Another quirks with this logic is that this `Get` parser advances the
+-- parser offset, except when `JpgScanBlob` is encountered; in that case it
+-- advances the the parser offset only to right after the SOS (Start of Scan) tag.
+-- This means that `parseNextFrameLazy` returns a `JpgScanBlob _ d`, the caller
+-- must call @Data.Binary.Get.skip (Data.ByteString.Lazy.length d)@
+-- to advance the parser state correctly before continuing to parse.
+-- `parseNextFrameLazy` cannot call `skip` itself in this case, because
+-- that would require determining @length d@ and thus @d@, which again
+-- would require traversing the entire compressed image data.
+--
+-- The drawback of the lazy `Just` is obviously is that the thunk inside it
+-- will keep the captured `ByteString` alive.
+-- Thus, if you do not want that, use `parseNextFrameStrict` instead.
+-- Further note that if you are reading a huge JPEG image from disk strictly,
+-- this will already incur a full traversal (namely creation) of the `hugeImageByteString`.
+-- Thus, `parseNextFrameLazy` only provides any benefit if you use read the
+-- image from disk using lazy IO (not recommended!) or something similar,
+-- such as creating the `hugeImageByteString` via @mmap()@.
+-- For strict disk reads that shall terminate early as in the example shown above,
+-- use `Data.Binary.Get`'s incremental input interface in combination with
+-- just the right amount of `parseNextFrameStrict` calls for your needs.
+parseNextFrameLazy :: Get (Maybe JpgFrame)
+-- TODO This function is still bad because it calls `getRemainingLazyBytes` so it cannot be composed
+--      with following `Get` functions. This makes its standalone existence rather pointless.
+parseNextFrameLazy = do
     kind <- get
     case kind of
         JpgEndOfImage -> return Nothing
@@ -580,24 +657,36 @@ parseNextFrame = do
             (\(TableList huffTables) -> Just $!
                     JpgHuffmanTable [(t, packHuffmanTree . buildPackedHuffmanTree $ huffCodes t) | t <- huffTables])
                     <$> get
-        JpgStartOfScan -> do
-            scanHeader <- get
-            (d, _other) <- extractScanContent <$> lookAhead getRemainingLazyBytes
-            skip (fromIntegral $ L.length d)
-            return $ Just $! JpgScanBlob scanHeader d
+        JpgStartOfScan -> trace "\n-JpgStartOfScan-\n" $ do
+            scanHeader <- trace "\n-JpgStartOfScan_get-\n" $ get
+            -- ~(d, _other) <- trace "\n-JpgStartOfScan_extractScanContent-\n" $ extractScanContent <$> lookAhead getRemainingLazyBytes
+            -- skip (fromIntegral $ L.length d)
+            -- trace "\n-JpgStartOfScan_return-\n" $! return $ Just $ JpgScanBlob scanHeader d
+            remainingBytes <- lookAhead getRemainingLazyBytes
+            trace "\n-JpgStartOfScan_return-\n" $
+              return $ Just $ -- critically no `$!` after `Just`, see function docs.
+                let (d, _other) = extractScanContent remainingBytes in JpgScanBlob scanHeader d
         _ -> Just . JpgScans kind <$> get
+
+-- | See `parseNextFrameLazy`.
+parseNextFrameStrict :: Get (Maybe JpgFrame)
+parseNextFrameStrict = do
+    mbFrame <- parseNextFrameLazy
+    case mbFrame of
+        Just !_frame -> return mbFrame
+        _ -> return mbFrame
 
 parseFrames :: Get [JpgFrame]
 parseFrames = do
-    mbFrame <- parseNextFrame
+    mbFrame <- trace "\n-parseNextFrameLazy-\n" $ parseNextFrameLazy
     case mbFrame of
-        Nothing -> parseFollowingFrames -- skip frame
-        Just frame -> case frame of
+        Nothing -> trace "\n-A1-\n" $ parseFollowingFrames -- skip frame
+        Just frame -> trace "\n-A2-\n" $ case frame of
             -- After we've encountered the first scan blob containing encoded image data,
             -- we accept that anything else after that is allowed to fail and we'll ignore
             -- that failure.
             -- TODO: Explain why JuicyPixel chose to use this logic.
-            JpgScanBlob{} -> do
+            JpgScanBlob _scanHeader d -> trace "\n-ScanBlob-\n" $ do
                 -- Note that we do this funny thing of doing `runGet` inside a `Get` parser.
                 -- This is because `binary` does not allow to run a parser and catch a `fail`,
                 -- (Which is what the current logic below does, namely just discarding any failing
@@ -606,13 +695,30 @@ parseFrames = do
                 -- `Get` consume all the way to the end of the input), and running a new `Get`
                 -- on `other`.
                 -- Note this will make the error offset recorded by `fail` unhelpful because it
-                -- will be relative to the the start of `other`, not relative to the start of the JPG.
-                remainingBytes <- getRemainingLazyBytes
-                case runGet parseFrames (L.drop 1 remainingBytes) of -- TODO Why `drop 1` instead of `runGet parseFollowingFrames remainingBytes` that would check that the dropped 1 Byte is really a frame marker?
-                    Left _ -> return [frame]
-                    Right lst -> return $ frame : lst
+                -- will be relative to the start of `other`, not relative to the start of the JPG.
 
-            _ -> (frame :) <$> parseFollowingFrames
+                -- TODO: The lines
+                --       ```hs
+                --       JpgScanBlob _scanHeader d -> do
+                --           remainingBytes <- getRemainingLazyBytes
+                --           ...
+                --       ```
+                --       cannot be written without making `parseFrames :: Get [JpgFrame]` non-lazy (and thus slow for my use case).
+                --       This is becuase `JpgScanBlob` has strict fields.
+                --       This means I cannot have `parseNextFrameLazy` be in its own factored-out function.
+                --
+                --       This shows nicely a case where StrictData actually makes some task harder:
+                --       It is now harder to refactor code that uses constructors with strict fields,
+                --       because it inserts hidden `seq`s into the control flow.
+
+                remainingBytes <- getRemainingLazyBytes
+                -- `parseNextFrameLazy` describes how it does not advance the parser state
+                -- for `JpgScanBlob`s, so we need to do that manually.
+                return $ frame : case runGet parseFrames (L.drop (L.length d + 1) remainingBytes) of -- TODO Why `drop 1` instead of `runGet parseFollowingFrames remainingBytes` that would check that the dropped 1 Byte is really a frame marker?
+                    Left _ -> []
+                    Right lst -> lst
+
+            _ -> trace "\n-NotScanBlob-\n" $ (frame :) <$> parseFollowingFrames
   where
     parseFollowingFrames = do
         skipFrameMarker
@@ -621,7 +727,7 @@ parseFrames = do
 -- | Parses forward, returning the first scan header encountered.
 parseToFirstFrameHeader :: Get (Maybe JpgFrameHeader)
 parseToFirstFrameHeader = do
-    mbFrame <- parseNextFrame
+    mbFrame <- parseNextFrameStrict
     case mbFrame of
         Nothing -> continueSearching
         Just frame -> case frame of
