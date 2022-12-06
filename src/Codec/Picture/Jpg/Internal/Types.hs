@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE CPP #-}
 
@@ -40,6 +41,9 @@ module Codec.Picture.Jpg.Internal.Types( MutableMacroBlock
                               , parseFrames
                               , parseFrameKinds
                               , parseToFirstFrameHeader
+                              , checkImageEquivalence
+                              , extractScanContent
+                              , parseFramesOld
                               ) where
 
 
@@ -83,6 +87,7 @@ import Data.Binary.Get( Get
                       , lookAhead
                       , ByteOffset
                       , getLazyByteString
+                      , runGetOrFail
                       )
 import qualified Data.Binary.Get.Internal as GetInternal
 
@@ -460,6 +465,33 @@ instance Binary JpgImage where
         -- let endOfImageMarker = 0xD9
         {-checkMarker commonMarkerFirstByte endOfImageMarker-}
         return JpgImage { jpgFrame = frames }
+
+getJpgImageOld :: Get JpgImage
+getJpgImageOld = do
+    skipUntilFrames
+    frames <- parseFramesOld
+    -- let endOfImageMarker = 0xD9
+    {-checkMarker commonMarkerFirstByte endOfImageMarker-}
+    return JpgImage { jpgFrame = frames }
+
+checkImageEquivalence :: FilePath -> IO ()
+checkImageEquivalence fp = do
+    bs <- L.readFile fp
+    let simpleResult x = case x of
+            Left (_rest, offset, err) -> Left ("ERROR", offset, err)
+            Right (_rest, offset, _jpgImage) -> Right (offset)
+    let resOld = runGetOrFail getJpgImageOld bs
+    let resNew = runGetOrFail (get @JpgImage) bs
+    print ("JpgImage", resOld == resNew)
+    print ("simpleResult resOld", simpleResult resOld)
+    print ("simpleResult resNew", simpleResult resNew)
+    case (resOld, resNew) of
+        (Right (restOld, offsetOld, jpgImageOld), Right (restNew, offsetNew, jpgImageNew)) -> do
+            print ("offset equivalence", offsetOld == offsetNew)
+            print ("rest equivalence", restOld == restNew)
+            print ("frames equivalence", jpgFrame jpgImageOld == jpgFrame jpgImageNew)
+        _ -> print ("parses did not both succeed")
+
 
 skipUntilFrames :: Get ()
 skipUntilFrames = do
@@ -1057,3 +1089,62 @@ printPureMacroBlock block = pLn 0
 {-# INLINE dctBlockSize #-}
 dctBlockSize :: Num a => a
 dctBlockSize = 8
+
+
+extractScanContent :: L.ByteString -> (L.ByteString, L.ByteString)
+extractScanContent str = aux 0
+  where maxi = fromIntegral $ L.length str - 1
+
+        aux n | n >= maxi = (str, L.empty)
+              | v == 0xFF && vNext /= 0 && not isReset = L.splitAt n str
+               | otherwise = aux (n + 1)
+             where v = str `L.index` n
+                   vNext = str `L.index` (n + 1)
+                   isReset = 0xD0 <= vNext && vNext <= 0xD7
+
+parseFramesOld :: Get [JpgFrame]
+parseFramesOld = do
+    kind <- get
+    case kind of
+        JpgEndOfImage -> return []
+        JpgAppSegment 0 ->
+            (\frm lst -> maybeToList (parseJF__ frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgAppSegment 1 ->
+            (\frm lst -> maybeToList (parseExif frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgAppSegment 14 ->
+            (\frm lst -> maybeToList (parseAdobe14 frm) ++ lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgAppSegment c ->
+            (\frm lst -> JpgAppFrame c frm : lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgExtensionSegment c ->
+            (\frm lst -> JpgExtension c frm : lst) <$> takeCurrentFrame <*> parseFollowingFrames
+        JpgQuantizationTable ->
+            (\(TableList quants) lst -> JpgQuantTable quants : lst) <$> get <*> parseFollowingFrames
+        JpgRestartInterval ->
+            (\(RestartInterval i) lst -> JpgIntervalRestart i : lst) <$> get <*> parseFollowingFrames
+        JpgHuffmanTableMarker ->
+            (\(TableList huffTables) lst ->
+                    JpgHuffmanTable [(t, packHuffmanTree . buildPackedHuffmanTree $ huffCodes t) | t <- huffTables] : lst)
+                    <$> get <*> parseFollowingFrames
+        JpgStartOfScan ->
+            (\scanHeader remainingBytes ->
+                -- Note that we do this funny thing of doing `runGet` inside a `Get` parser.
+                -- This is because `binary` does not allow to run a parser and catch a `fail`,
+                -- (Which is what the current logic below does, namely just discarding any failing
+                -- parser after the first decoded scan blob.)
+                -- Doing that is emulated by calling `extractScanContent` (which makes the current
+                -- `Get` consume all the way to the end of the input), and running a new `Get`
+                -- on `other`.
+                -- Note this will make the error offset recorded by `fail` unhelpful because it
+                -- will be relative to the the start of `other`, not relative to the start of the JPG.
+                let (d, other) = extractScanContent remainingBytes
+                in
+                case runGet parseFramesOld (L.drop 1 other) of
+                  Left _ -> [JpgScanBlob scanHeader d]
+                  Right lst -> JpgScanBlob scanHeader d : lst
+            ) <$> get <*> getRemainingLazyBytes
+
+        _ -> (\hdr lst -> JpgScans kind hdr : lst) <$> get <*> parseFollowingFrames
+  where
+    parseFollowingFrames = do
+        skipFrameMarker
+        parseFramesOld
